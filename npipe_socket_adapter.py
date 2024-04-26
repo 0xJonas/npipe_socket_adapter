@@ -16,7 +16,7 @@ $pipe = New-Object "System.IO.Pipes.NamedPipeServerStream" -ArgumentList @(
     [System.IO.Pipes.PipeTransmissionMode]::Byte,
     [System.IO.Pipes.PipeOptions]::Asynchronous
 );
-$pipe.WaitForConnection();
+$pipe.WaitForConnection()
 Write-Output "Connected!"
 [System.threading.Tasks.Task]::WaitAny(@(
     [System.Console]::OpenStandardInput().CopyToAsync($pipe),
@@ -47,7 +47,7 @@ connection_id = 0
 
 async def copy_to_async(reader, writer):
     try:
-        async for d in reader:
+        while d := await reader.read(1024):
             writer.write(d)
             await writer.drain()
     finally:
@@ -82,6 +82,8 @@ async def serve_named_pipe(pipe_name, callback):
 
             proc = await asyncio.create_subprocess_exec(
                 POWERSHELL_EXE,
+                "-NonInteractive",
+                "-NoProfile",
                 "-Command",
                 SCRIPT_SERVER.format(pipe_name=pipe_name),
                 stdin=subprocess.PIPE,
@@ -103,6 +105,8 @@ async def serve_named_pipe(pipe_name, callback):
 async def connect_to_named_pipe(pipe_name, reader, writer):
     proc = await asyncio.create_subprocess_exec(
         POWERSHELL_EXE,
+        "-NonInteractive",
+        "-NoProfile",
         "-Command",
         SCRIPT_CLIENT.format(pipe_name=pipe_name),
         stdin=subprocess.PIPE,
@@ -116,12 +120,12 @@ async def connect_to_named_pipe(pipe_name, reader, writer):
 
 
 async def serve_unix_socket(socket_name, callback):
-    def logging_callback(reader, writer):
+    async def logging_callback(reader, writer):
         global connection_id
         cid = connection_id
         connection_id += 1
         logger.info("New connection: %d.", cid)
-        callback(reader, writer)
+        await callback(reader, writer)
         logger.info("Connection closed: %d.", cid)
 
     server = await asyncio.start_unix_server(logging_callback, socket_name)

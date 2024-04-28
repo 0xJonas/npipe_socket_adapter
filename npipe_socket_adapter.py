@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import logging
+import signal
 import subprocess
 
 POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
@@ -46,12 +47,32 @@ connection_id = 0
 
 
 async def copy_to_async(reader, writer):
-    try:
-        while d := await reader.read(1024):
-            writer.write(d)
-            await writer.drain()
-    finally:
-        writer.close()
+    wait_closed_task = asyncio.create_task(writer.wait_closed())
+    while True:
+        read_task = asyncio.create_task(reader.read(1024))
+        done, _ = await asyncio.wait(
+            [read_task, wait_closed_task], return_when=asyncio.FIRST_COMPLETED
+        )
+
+        if wait_closed_task in done:
+            # Writer was closed
+            read_task.cancel()
+            break
+        elif read_task in done:
+            data = read_task.result()
+            if data:
+                writer.write(data)
+                await writer.drain()
+            else:
+                # reader.read() returned an empty bytes object, so the reader was closed.
+                break
+
+
+def _setup_stop_task():
+    event = asyncio.Event()
+    asyncio.get_running_loop().add_signal_handler(signal.SIGINT, event.set)
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, event.set)
+    return asyncio.create_task(event.wait())
 
 
 async def serve_named_pipe(pipe_name, callback):
@@ -61,44 +82,70 @@ async def serve_named_pipe(pipe_name, callback):
         cid = connection_id
         connection_id += 1
         logger.info("New connection: %d.", cid)
-        try:
-            await callback(proc.stdout, proc.stdin)
-        finally:
-            await proc.wait()
-            logger.info("Connection closed: %d.", cid)
-            if pipe_free is not None:
-                pipe_free.set()
+
+        callback_task = asyncio.create_task(callback(proc.stdout, proc.stdin))
+        done, _ = await asyncio.wait(
+            [callback_task, should_terminate], return_when=asyncio.FIRST_COMPLETED
+        )
+        if should_terminate in done:
+            callback_task.cancel()
+            proc.terminate()
+        await proc.wait()
+        logger.info("Connection closed: %d.", cid)
+        if pipe_free is not None:
+            pipe_free.set()
 
     logger.info("Serving named pipe %s.", pipe_name)
+
+    should_terminate = _setup_stop_task()
 
     # Event to signal that the pipe is definitely free.
     # Used to not unnecessarily try connecting to the pipe in a loop.
     pipe_free = None
     while True:
-        try:
-            if pipe_free is not None:
-                await pipe_free
-                pipe_free = None
+        if pipe_free is not None:
+            await pipe_free
+            pipe_free = None
 
-            proc = await asyncio.create_subprocess_exec(
-                POWERSHELL_EXE,
-                "-NonInteractive",
-                "-NoProfile",
-                "-Command",
-                SCRIPT_SERVER.format(pipe_name=pipe_name),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-            )
-            output = await proc.stdout.readexactly(len(CONNECTION_SENTINEL))
-        except asyncio.CancelledError:
+        proc = await asyncio.create_subprocess_exec(
+            POWERSHELL_EXE,
+            "-NonInteractive",
+            "-NoProfile",
+            "-Command",
+            SCRIPT_SERVER.format(pipe_name=pipe_name),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            # Put each subprocess into a new process group.
+            # This is used to streamline the code for graceful shutdown.
+            # Ctrl+C normally sends SIGINT to the entire process group, which
+            # would also stop the subprocesses, while `kill <pid>` sends SIGTERM
+            # only to the Python process. Putting each subprocess into its own
+            # group means that the signals send by Ctrl+C and `kill <pid>` are both
+            # only received by the Python process, and the Python process is in charge
+            # of stopping its subprocesses.
+            start_new_session=True,
+        )
+        wait_for_connection_task = asyncio.create_task(
+            proc.stdout.readexactly(len(CONNECTION_SENTINEL))
+        )
+
+        done, _ = await asyncio.wait(
+            [wait_for_connection_task, should_terminate],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if should_terminate in done:
+            logger.info("Interrupt received.")
+            wait_for_connection_task.cancel()
             proc.terminate()
-            raise
+            await proc.wait()
+            break
 
-        if output == CONNECTION_SENTINEL:
+        if wait_for_connection_task.result() == CONNECTION_SENTINEL:
             asyncio.create_task(serve_single(proc))
         else:
             logger.error("Unable to open named pipe server stream.")
             proc.terminate()
+            await proc.terminate()
             pipe_free = asyncio.Event()
 
 
@@ -111,6 +158,7 @@ async def connect_to_named_pipe(pipe_name, reader, writer):
         SCRIPT_CLIENT.format(pipe_name=pipe_name),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
+        start_new_session=True,
     )
     logger.info("Connected to named pipe %s.", pipe_name)
     await asyncio.gather(
@@ -122,16 +170,26 @@ async def connect_to_named_pipe(pipe_name, reader, writer):
 async def serve_unix_socket(socket_name, callback):
     async def logging_callback(reader, writer):
         global connection_id
-        cid = connection_id
-        connection_id += 1
-        logger.info("New connection: %d.", cid)
-        await callback(reader, writer)
-        logger.info("Connection closed: %d.", cid)
+        try:
+            cid = connection_id
+            connection_id += 1
+            logger.info("New connection: %d.", cid)
+            await callback(reader, writer)
+        finally:
+            logger.info("Connection closed: %d.", cid)
 
+    should_terminate = _setup_stop_task()
     server = await asyncio.start_unix_server(logging_callback, socket_name)
     logger.info("Serving UNIX socket %s", socket_name)
     async with server:
-        await server.serve_forever()
+        server_task = asyncio.create_task(server.serve_forever())
+        done, _ = await asyncio.wait(
+            [server_task, should_terminate],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if should_terminate in done:
+            logger.info("Interrupt received.")
+            server_task.cancel()
 
 
 async def connect_to_unix_socket(socket_name, reader, writer):
@@ -153,7 +211,7 @@ def main():
         help="""\
 Directing in which to forward the data. Must be one of:
 - 'npipe-to-socket': Expose an existing named pipe as a UNIX domain socket within WSL 2.
-- 'socket-to-npipe': Expose an existing UNIX domain socket as a named pipe within the Windows host..
+- 'socket-to-npipe': Expose an existing UNIX domain socket as a named pipe within the Windows host.
 """,
     )
     parser.add_argument("--npipe", "-n", help="Name of the named pipe.", required=True)
@@ -167,7 +225,10 @@ Directing in which to forward the data. Must be one of:
     args = parser.parse_args()
 
     if args.verbose:
-        logging.basicConfig(level=logging.INFO)
+        logging.basicConfig(
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            level=logging.INFO,
+        )
 
     if args.direction == "npipe-to-socket":
         asyncio.run(
@@ -181,6 +242,8 @@ Directing in which to forward the data. Must be one of:
                 args.npipe, lambda r, w: connect_to_unix_socket(args.socket, r, w)
             )
         )
+    else:
+        logger.fatal("Unknown forwarding direction %s.", args.direction)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,6 @@ import logging
 import signal
 import subprocess
 
-POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 CONNECTION_SENTINEL = b"Connected!\r\n"
 
 SCRIPT_SERVER = """\
@@ -75,7 +74,7 @@ def _setup_stop_task():
     return asyncio.create_task(event.wait())
 
 
-async def serve_named_pipe(pipe_name, callback):
+async def serve_named_pipe(pipe_name, powershell_exe, callback):
     async def serve_single(proc):
         global connection_id
         nonlocal pipe_free
@@ -108,7 +107,7 @@ async def serve_named_pipe(pipe_name, callback):
             pipe_free = None
 
         proc = await asyncio.create_subprocess_exec(
-            POWERSHELL_EXE,
+            powershell_exe,
             "-NonInteractive",
             "-NoProfile",
             "-Command",
@@ -149,9 +148,9 @@ async def serve_named_pipe(pipe_name, callback):
             pipe_free = asyncio.Event()
 
 
-async def connect_to_named_pipe(pipe_name, reader, writer):
+async def connect_to_named_pipe(pipe_name, powershell_exe, reader, writer):
     proc = await asyncio.create_subprocess_exec(
-        POWERSHELL_EXE,
+        powershell_exe,
         "-NonInteractive",
         "-NoProfile",
         "-Command",
@@ -209,14 +208,27 @@ def main():
     parser.add_argument(
         "direction",
         help="""\
-Directing in which to forward the data. Must be one of:
-- 'npipe-to-socket': Expose an existing named pipe as a UNIX domain socket within WSL 2.
-- 'socket-to-npipe': Expose an existing UNIX domain socket as a named pipe within the Windows host.
-""",
+Whether to expose an existing Windows named pipe as a UNIX domain socket (npipe-to-socket),
+or to expose an existig UNIX domain socket as a Windows named pipe (socket-to-npipe)""",
+        choices=["npipe-to-socket", "socket-to-npipe"],
     )
-    parser.add_argument("--npipe", "-n", help="Name of the named pipe.", required=True)
+    parser.add_argument(
+        "--npipe",
+        "-n",
+        help=r"Name of the named pipe. The name must NOT include the leading '\\.\pipe\'",
+        required=True,
+    )
     parser.add_argument(
         "--socket", "-s", help="Name of the UNIX domain socket.", required=True
+    )
+    parser.add_argument(
+        "-p",
+        "--powershell",
+        help="""\
+Location of the Powershell executable to use.
+Powershell is used to convert a connection to a named pipe
+to standard IO streams.""",
+        default="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
     )
     parser.add_argument(
         "--verbose", "-v", help="Enable verbose output.", action="store_true"
@@ -233,17 +245,18 @@ Directing in which to forward the data. Must be one of:
     if args.direction == "npipe-to-socket":
         asyncio.run(
             serve_unix_socket(
-                args.socket, lambda r, w: connect_to_named_pipe(args.npipe, r, w)
+                args.socket,
+                lambda r, w: connect_to_named_pipe(args.npipe, args.powershell, r, w),
             )
         )
     elif args.direction == "socket-to-npipe":
         asyncio.run(
             serve_named_pipe(
-                args.npipe, lambda r, w: connect_to_unix_socket(args.socket, r, w)
+                args.npipe,
+                args.powershell,
+                lambda r, w: connect_to_unix_socket(args.socket, r, w),
             )
         )
-    else:
-        logger.fatal("Unknown forwarding direction %s.", args.direction)
 
 
 if __name__ == "__main__":

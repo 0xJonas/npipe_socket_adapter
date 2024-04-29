@@ -40,3 +40,7 @@ optional arguments:
                         Location of the Powershell executable to use. Powershell is used to convert a connection to a named pipe to standard IO streams.
   --verbose, -v         Enable verbose output.
 ```
+
+## License
+
+This script is distributed under the MIT License. The license text is included in the script's source.
